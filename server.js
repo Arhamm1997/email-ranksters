@@ -25,7 +25,9 @@ db.serialize(() => {
       user_agent TEXT,
       first_opened DATETIME,
       last_opened DATETIME,
-      open_count INTEGER DEFAULT 0
+      open_count INTEGER DEFAULT 0,
+      sender_ip TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 });
@@ -36,6 +38,21 @@ const transparentPixel = Buffer.from(
   'base64'
 );
 
+// Helper function to check if IP is likely Gmail proxy
+function isGmailProxy(userAgent, ip) {
+  if (!userAgent) return false;
+  const ua = userAgent.toLowerCase();
+  return ua.includes('google') || ua.includes('gmail') || ua.includes('googleimageproxy');
+}
+
+// Helper function to check if it's too soon after creation (likely sender viewing)
+function isTooSoonAfterCreation(createdAt) {
+  if (!createdAt) return false;
+  const timeDiff = Date.now() - new Date(createdAt).getTime();
+  // If opened within 2 minutes of creation, likely sender viewing in Sent folder
+  return timeDiff < 120000; // 2 minutes
+}
+
 // Tracking pixel endpoint
 app.get('/track/:trackingId.png', (req, res) => {
   const { trackingId } = req.params;
@@ -43,7 +60,7 @@ app.get('/track/:trackingId.png', (req, res) => {
   const userAgent = req.headers['user-agent'] || 'Unknown';
   const timestamp = new Date().toISOString();
   
-  console.log(`📧 Email opened! Tracking ID: ${trackingId}`);
+  console.log(`📧 Tracking pixel loaded! ID: ${trackingId}`);
   console.log(`   IP: ${ipAddress}`);
   console.log(`   User Agent: ${userAgent}`);
   console.log(`   Time: ${timestamp}`);
@@ -53,21 +70,46 @@ app.get('/track/:trackingId.png', (req, res) => {
     if (err) {
       console.error('Database error:', err);
     } else if (row) {
-      // Update existing record
-      db.run(
-        'UPDATE email_tracking SET last_opened = ?, open_count = open_count + 1, ip_address = ?, user_agent = ? WHERE tracking_id = ?',
-        [timestamp, ipAddress, userAgent, trackingId]
-      );
+      // Email already tracked - this is a subsequent open
+      const isSenderIP = row.sender_ip && ipAddress === row.sender_ip;
+      const isGmailProxyOpen = isGmailProxy(userAgent, ipAddress);
+      const isTooSoon = isTooSoonAfterCreation(row.created_at);
+      
+      console.log(`   📊 Existing record found`);
+      console.log(`   🔍 Same IP as sender: ${isSenderIP}`);
+      console.log(`   🔍 Gmail proxy: ${isGmailProxyOpen}`);
+      console.log(`   🔍 Too soon: ${isTooSoon}`);
+      
+      // Only count as real open if:
+      // 1. Not from sender's IP OR
+      // 2. More than 2 minutes have passed since creation
+      if (!isSenderIP || !isTooSoon) {
+        db.run(
+          'UPDATE email_tracking SET last_opened = ?, open_count = open_count + 1, ip_address = ?, user_agent = ? WHERE tracking_id = ?',
+          [timestamp, ipAddress, userAgent, trackingId]
+        );
+        console.log(`   ✅ Counted as REAL open (count: ${row.open_count + 1})`);
+      } else {
+        console.log(`   ⚠️ IGNORED - Sender viewing own email`);
+      }
     } else {
-      // Insert new record
+      // First time seeing this tracking ID - record sender's IP
+      console.log(`   🆕 New tracking ID - Recording sender IP`);
       db.run(
-        'INSERT INTO email_tracking (tracking_id, ip_address, user_agent, first_opened, last_opened, open_count) VALUES (?, ?, ?, ?, ?, 1)',
-        [trackingId, ipAddress, userAgent, timestamp, timestamp]
+        'INSERT INTO email_tracking (tracking_id, ip_address, user_agent, first_opened, last_opened, open_count, sender_ip) VALUES (?, ?, ?, ?, ?, 0, ?)',
+        [trackingId, ipAddress, userAgent, timestamp, timestamp, ipAddress],
+        (insertErr) => {
+          if (insertErr) {
+            console.error('Insert error:', insertErr);
+          } else {
+            console.log(`   ✅ Sender IP recorded: ${ipAddress}`);
+          }
+        }
       );
     }
   });
   
-  // Return transparent pixel
+  // Always return transparent pixel
   res.set({
     'Content-Type': 'image/png',
     'Cache-Control': 'no-store, no-cache, must-revalidate, private',
@@ -82,13 +124,23 @@ app.get('/api/recent-opens', (req, res) => {
   const since = req.query.since || new Date(Date.now() - 3600000).toISOString(); // Last hour by default
   
   db.all(
-    'SELECT tracking_id, ip_address, first_opened, last_opened, open_count FROM email_tracking WHERE first_opened > ? ORDER BY first_opened DESC',
+    `SELECT tracking_id, ip_address, first_opened, last_opened, open_count, sender_ip, created_at 
+     FROM email_tracking 
+     WHERE first_opened > ? AND open_count > 0
+     ORDER BY first_opened DESC`,
     [since],
     (err, rows) => {
       if (err) {
         res.status(500).json({ error: 'Database error' });
       } else {
-        res.json(rows.map(row => ({
+        // Filter out opens that are too soon (likely sender viewing)
+        const realOpens = rows.filter(row => {
+          const timeDiff = Date.now() - new Date(row.created_at).getTime();
+          // Only include if more than 2 minutes have passed since creation
+          return timeDiff >= 120000 || row.open_count > 1;
+        });
+        
+        res.json(realOpens.map(row => ({
           trackingId: row.tracking_id,
           ipAddress: row.ip_address,
           timestamp: new Date(row.first_opened).getTime(),
@@ -114,7 +166,8 @@ app.get('/api/tracking/:trackingId', (req, res) => {
         userAgent: row.user_agent,
         firstOpened: row.first_opened,
         lastOpened: row.last_opened,
-        openCount: row.open_count
+        openCount: row.open_count,
+        senderIp: row.sender_ip
       });
     } else {
       res.status(404).json({ error: 'Tracking ID not found' });
@@ -125,7 +178,7 @@ app.get('/api/tracking/:trackingId', (req, res) => {
 // API to get all tracking data
 app.get('/api/all-tracking', (req, res) => {
   db.all(
-    'SELECT tracking_id, ip_address, first_opened, last_opened, open_count FROM email_tracking ORDER BY first_opened DESC LIMIT 100',
+    'SELECT tracking_id, ip_address, first_opened, last_opened, open_count, sender_ip FROM email_tracking WHERE open_count > 0 ORDER BY first_opened DESC LIMIT 100',
     [],
     (err, rows) => {
       if (err) {
@@ -201,6 +254,13 @@ app.get('/', (req, res) => {
         .copy-url:hover {
           background: #3367d6;
         }
+        .new-feature {
+          background: #fff3cd;
+          padding: 15px;
+          border-radius: 5px;
+          margin: 15px 0;
+          border-left: 3px solid #ffc107;
+        }
       </style>
     </head>
     <body>
@@ -208,10 +268,15 @@ app.get('/', (req, res) => {
         <h1>📧 Email Tracker Server</h1>
         <div class="status">✓ Server Running</div>
         
+        <div class="new-feature">
+          <strong>🆕 New Feature:</strong> Smart sender detection! The server now ignores when you view your own sent emails, preventing false "Email Opened" notifications.
+        </div>
+        
         <h3>Server Information:</h3>
         <p><strong>Status:</strong> Active and ready to track emails</p>
         <p><strong>URL:</strong> <code>${req.protocol}://${req.get('host')}</code></p>
         <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+        <p><strong>Version:</strong> 2.0 (IP Filtering Enabled)</p>
         
         <h3>Available Endpoints:</h3>
         
@@ -224,7 +289,7 @@ app.get('/', (req, res) => {
         <div class="endpoint">
           <strong>Recent Opens:</strong><br>
           <code>GET /api/recent-opens</code><br>
-          <small>Returns list of recently opened emails</small>
+          <small>Returns list of recently opened emails (filters out sender views)</small>
         </div>
         
         <div class="endpoint">
@@ -261,7 +326,8 @@ app.get('/', (req, res) => {
         <div class="info">
           <strong>🔒 Security Note:</strong> This server is for email tracking only. 
           No sensitive data is displayed publicly.<br><br>
-          <strong>📊 Usage:</strong> Use this URL in your Chrome Extension settings to enable tracking.
+          <strong>📊 Usage:</strong> Use this URL in your Chrome Extension settings to enable tracking.<br><br>
+          <strong>🎯 Smart Detection:</strong> The server now tracks sender IP and ignores opens within 2 minutes of sending to prevent false positives.
         </div>
       </div>
     </body>
@@ -274,6 +340,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     message: 'Email tracking server is running',
+    version: '2.0-ip-filtering',
     timestamp: new Date().toISOString()
   });
 });
@@ -284,6 +351,7 @@ app.listen(PORT, () => {
   console.log(`📍 Server running on http://localhost:${PORT}`);
   console.log(`📧 Tracking endpoint: http://localhost:${PORT}/track/{tracking_id}.png`);
   console.log(`📊 API endpoint: http://localhost:${PORT}/api/recent-opens`);
+  console.log('🎯 Smart sender detection: ENABLED');
   console.log('\n✅ Ready to track emails!\n');
 });
 
